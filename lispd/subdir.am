@@ -1,0 +1,40 @@
+#
+# lispd
+#
+
+if LISPD
+noinst_LIBRARIES += lispd/liblisp.a
+sbin_PROGRAMS += lispd/lispd
+dist_examples_DATA += lispd/lispd.conf.sample
+vtysh_scan += \
+	$(top_srcdir)/lispd/lisp_cli.c \
+	$(top_srcdir)/lispd/lisp_debug.c \
+	$(top_srcdir)/lispd/lispd.c \
+	# end
+
+man8 += $(MANBUILD)/lispd.8
+endif
+
+lispd_liblisp_a_SOURCES = \
+	lispd/lisp_cli.c \
+	lispd/lisp_debug.c \
+	lispd/lisp_errors.c \
+	lispd/lisp_interface.c \
+	lispd/lisp_memory.c \
+	lispd/lisp_zebra.c \
+	lispd/lispd.c \
+	# end
+
+noinst_HEADERS += \
+	lispd/lisp_cli.h \
+	lispd/lisp_debug.h \
+	lispd/lisp_errors.h \
+	lispd/lisp_interface.h \
+	lispd/lisp_memory.h \
+	lispd/lispd.h \
+	# end
+
+lispd_lispd_LDADD = lispd/liblisp.a lib/libfrr.la $(LIBCAP)
+lispd_lispd_SOURCES = \
+	lispd/lisp_main.c \
+	# end
