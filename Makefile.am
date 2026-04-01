@@ -129,6 +129,7 @@ include solaris/subdir.am
 include bgpd/subdir.am
 include bgpd/rfp-example/librfp/subdir.am
 include bgpd/rfp-example/rfptest/subdir.am
+include lispd/subdir.am
 include ripd/subdir.am
 include ripngd/subdir.am
 include ospfd/subdir.am

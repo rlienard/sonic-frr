@@ -1,0 +1,22 @@
+! Sample lispd configuration file.
+! See the FRR documentation for a full reference.
+!
+! Enable LISP for the default VRF
+router lisp
+ !
+ ! Register a local EID prefix
+ eid-prefix 192.0.2.0/24
+ !
+ ! Map-Server address
+ map-server 10.0.0.1
+ !
+ ! Map-Resolver address
+ map-resolver 10.0.0.1
+!
+! Optional debug flags (uncomment to enable)
+! debug lisp events
+! debug lisp packet
+! debug lisp map-cache
+! debug lisp zebra
+!
+log file /var/log/frr/lispd.log
