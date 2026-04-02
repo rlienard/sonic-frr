@@ -89,3 +89,4 @@ GPATH
 compile_commands.json
 .dirstamp
 refix
+.DS_Store
