@@ -41,6 +41,7 @@
 #include "lispd/lisp_packet.h"
 #include "lispd/lisp_auth.h"
 #include "lispd/lisp_pubsub.h"
+#include "lispd/lisp_vxlan.h"
 
 DEFINE_HOOK(lisp_ifaddr_add, (struct connected *ifc), (ifc))
 DEFINE_HOOK(lisp_ifaddr_del, (struct connected *ifc), (ifc))
@@ -1033,6 +1034,20 @@ struct lisp *lisp_create(const char *vrf_name, struct vrf *vrf, int socket)
 	lisp->subscriptions = list_new();
 	lisp->sub_states    = list_new();
 
+	/* VxLAN-GPE data-plane state (RFC 9301 §2.4). */
+	lisp->data_sock         = lisp_vxlan_create_socket(vrf);
+	lisp->default_vni       = 0;
+	lisp->local_sgt         = 0; /* LISP_SGT_UNTAGGED */
+	lisp->gbp_enabled       = false;
+	lisp->gbp_default_permit = true;
+	lisp->sgt_table         = route_table_init();
+	lisp->gbp_policies      = list_new();
+
+	/* Arm VxLAN-GPE data receive thread if socket opened successfully. */
+	if (lisp->data_sock >= 0)
+		thread_add_read(master, lisp_vxlan_recv_packet, lisp,
+				lisp->data_sock, &lisp->t_data_read);
+
 	if (vrf)
 		vrf->info = lisp;
 
@@ -1109,6 +1124,18 @@ void lisp_clean(struct lisp *lisp)
 			XFREE(MTYPE_LISP_SUB_STATE, ss);
 		}
 		list_delete(&lisp->sub_states);
+	}
+
+	/* Clean VxLAN-GPE / GBP state. */
+	THREAD_OFF(lisp->t_data_read);
+	lisp_sgt_map_clean(lisp);
+	route_table_finish(lisp->sgt_table);
+	lisp->sgt_table = NULL;
+	lisp_gbp_policy_clean(lisp);
+	list_delete(&lisp->gbp_policies);
+	if (lisp->data_sock >= 0) {
+		close(lisp->data_sock);
+		lisp->data_sock = -1;
 	}
 
 	if (lisp->sock >= 0)

@@ -27,7 +27,6 @@
 #include "hash.h"
 #include "lispd/lisp_memory.h"
 #include "lispd/lisp_auth.h"
-
 /* UDP port numbers (RFC 9301). */
 #define LISP_DATA_PORT        4341
 #define LISP_CONTROL_PORT     4342
@@ -136,6 +135,18 @@ struct lisp_rloc {
 	 */
 	bool local;
 	bool reachable;
+
+	/*
+	 * VxLAN-GPE data-plane metadata.
+	 *
+	 * vni: 24-bit VxLAN Network Identifier for traffic encapsulated
+	 *      toward this RLOC.  0 means "use the instance default VNI".
+	 * sgt: 14-bit Security Group Tag associated with the remote endpoint
+	 *      behind this RLOC (used as dst_sgt in GBP policy evaluation).
+	 *      LISP_SGT_UNTAGGED (0) means no group tag.
+	 */
+	uint32_t vni;
+	uint16_t sgt;
 };
 
 /* -------------------------------------------------------------------------
@@ -259,6 +270,34 @@ struct lisp {
 	struct list *subscriptions;
 	struct list *sub_states;
 
+	/* ---------------------------------------------------------------
+	 * VxLAN-GPE data-plane state (RFC 9301 §2.4)
+	 * --------------------------------------------------------------- */
+
+	/* UDP socket on port 4789 for VxLAN-GPE encapsulated data traffic. */
+	int data_sock;
+
+	/* I/O thread for data_sock. */
+	struct thread *t_data_read;
+
+	/* Default 24-bit VNI for this instance (0 = not configured). */
+	uint32_t default_vni;
+
+	/*
+	 * GBP (Group Based Policy) / SGT (Security Group Tag) state.
+	 *
+	 * local_sgt:         14-bit SGT stamped on packets *sent* by this xTR.
+	 * gbp_enabled:       GBP enforcement active on received packets.
+	 * gbp_default_permit: action when no GBP rule matches (default: true).
+	 * sgt_table:         EID-prefix → SGT mapping (struct lisp_sgt_map).
+	 * gbp_policies:      ordered list of struct lisp_gbp_policy rules.
+	 */
+	uint16_t             local_sgt;
+	bool                 gbp_enabled;
+	bool                 gbp_default_permit;
+	struct route_table  *sgt_table;
+	struct list         *gbp_policies;
+
 	/* Map-Register periodic thread. */
 	struct thread *t_map_register;
 
@@ -357,6 +396,8 @@ extern void lisp_send_map_notify_ack(struct lisp *lisp,
 
 /* Packet I/O dispatch (called from t_read thread) */
 extern int lisp_recv_packet(struct thread *t);
+
+extern int  lisp_vxlan_create_socket(struct vrf *vrf);
 
 extern void lisp_if_init(void);
 extern void lisp_zclient_init(struct thread_master *master);

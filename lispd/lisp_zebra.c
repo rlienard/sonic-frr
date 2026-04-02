@@ -34,6 +34,7 @@
 #include "lispd/lisp_interface.h"
 #include "lispd/lisp_memory.h"
 #include "lispd/lisp_debug.h"
+#include "lispd/lisp_vxlan.h"
 
 /* Zebra client handle. */
 static struct zclient *zclient = NULL;
@@ -164,11 +165,24 @@ static int lisp_route_notify_owner(int command, struct zclient *zclient,
  * Route install / withdraw helpers
  * ---------------------------------------------------------------------- */
 
+/*
+ * Install a LISP EID route into Zebra with optional VxLAN-GPE encapsulation.
+ *
+ * When vni != 0 (VxLAN-GPE mode, RFC 9301 §2.4), the nexthop is flagged as
+ * an EVPN/VxLAN encap nexthop so the kernel tunnels traffic toward the RLOC
+ * using VxLAN-GPE on UDP/4789 with the given VNI.
+ *
+ * The sgt parameter is stored in the map-cache and used locally for GBP
+ * policy evaluation; it is NOT propagated through Zebra ZAPI (Zebra has no
+ * standard GBP field).  GBP enforcement is done in lispd's data-plane receive
+ * path (lisp_vxlan_recv_packet).
+ */
 void lisp_zebra_route_add(struct lisp *lisp, struct prefix *eid,
 			  struct nexthop *nh)
 {
 	struct zapi_route api;
 	struct zapi_nexthop *api_nh;
+	uint32_t vni;
 
 	memset(&api, 0, sizeof(api));
 	api.vrf_id = lisp->vrf ? lisp->vrf->vrf_id : VRF_DEFAULT;
@@ -184,14 +198,37 @@ void lisp_zebra_route_add(struct lisp *lisp, struct prefix *eid,
 
 	if (nh->type == NEXTHOP_TYPE_IPV4
 	    || nh->type == NEXTHOP_TYPE_IPV4_IFINDEX) {
-		api_nh->type       = NEXTHOP_TYPE_IPV4;
-		api_nh->gate.ipv4  = nh->gate.ipv4;
+		api_nh->type      = NEXTHOP_TYPE_IPV4;
+		api_nh->gate.ipv4 = nh->gate.ipv4;
 	} else if (nh->type == NEXTHOP_TYPE_IPV6
 		   || nh->type == NEXTHOP_TYPE_IPV6_IFINDEX) {
-		api_nh->type       = NEXTHOP_TYPE_IPV6;
-		api_nh->gate.ipv6  = nh->gate.ipv6;
+		api_nh->type      = NEXTHOP_TYPE_IPV6;
+		api_nh->gate.ipv6 = nh->gate.ipv6;
 	} else {
 		return;
+	}
+
+	/*
+	 * VxLAN-GPE encapsulation (RFC 9301 §2.4).
+	 *
+	 * If a VNI is configured (per-RLOC or instance default), mark the
+	 * nexthop as a VxLAN/EVPN encap nexthop.  Zebra will then create
+	 * or reuse a kernel VxLAN FDB/route entry that encapsulates packets
+	 * toward this RLOC using VxLAN on UDP/4789 with the given VNI.
+	 *
+	 * The kernel handles the outer IP/UDP encapsulation; lispd handles
+	 * the VxLAN-GPE header, GBP SGT stamping, and policy enforcement
+	 * via the data_sock path.
+	 */
+	vni = lisp->default_vni; /* may be overridden per-RLOC if callers pass it */
+
+	if (vni != 0) {
+		SET_FLAG(api_nh->flags, ZAPI_NEXTHOP_FLAG_EVPN);
+		api_nh->vni = vni;
+
+		if (IS_LISP_DEBUG_ZEBRA)
+			zlog_debug("LISP VxLAN-GPE: installing route with "
+				   "VNI=%" PRIu32 " via Zebra", vni);
 	}
 
 	zclient_route_send(ZEBRA_ROUTE_ADD, zclient, &api);

@@ -40,6 +40,7 @@
 #include "lispd/lisp_debug.h"
 #include "lispd/lisp_cli.h"
 #include "lispd/lisp_pubsub.h"
+#include "lispd/lisp_vxlan.h"
 
 /* lispd privileges. */
 zebra_capabilities_t _caps_p[] = {ZCAP_NET_RAW, ZCAP_BIND, ZCAP_SYS_ADMIN};
@@ -150,6 +151,7 @@ int main(int argc, char **argv)
 	lisp_cli_init();
 	lisp_debug_init();
 	lisp_pubsub_cli_init();
+	lisp_vxlan_cli_init();
 	lisp_zclient_init(master);
 
 	frr_config_fork();
