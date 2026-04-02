@@ -16,21 +16,25 @@ man8 += $(MANBUILD)/lispd.8
 endif
 
 lispd_liblisp_a_SOURCES = \
+	lispd/lisp_auth.c \
 	lispd/lisp_cli.c \
 	lispd/lisp_debug.c \
 	lispd/lisp_errors.c \
 	lispd/lisp_interface.c \
 	lispd/lisp_memory.c \
+	lispd/lisp_packet.c \
 	lispd/lisp_zebra.c \
 	lispd/lispd.c \
 	# end
 
 noinst_HEADERS += \
+	lispd/lisp_auth.h \
 	lispd/lisp_cli.h \
 	lispd/lisp_debug.h \
 	lispd/lisp_errors.h \
 	lispd/lisp_interface.h \
 	lispd/lisp_memory.h \
+	lispd/lisp_packet.h \
 	lispd/lispd.h \
 	# end
 
