@@ -1,4 +1,4 @@
-/* LISP (Locator/ID Separation Protocol) daemon.
+/* LISP (Locator/ID Separation Protocol) daemon — RFC 9301.
  * Copyright (C) 2024 FRR Project
  *
  * This file is part of FRRouting.
@@ -24,9 +24,11 @@
 #include "hook.h"
 #include "nexthop.h"
 #include "distribute.h"
-#include "lisp_memory.h"
+#include "hash.h"
+#include "lispd/lisp_memory.h"
+#include "lispd/lisp_auth.h"
 
-/* LISP port numbers (RFC 6830). */
+/* UDP port numbers (RFC 9301). */
 #define LISP_DATA_PORT        4341
 #define LISP_CONTROL_PORT     4342
 
@@ -36,13 +38,24 @@
 /* Default configuration file name. */
 #define LISPD_DEFAULT_CONFIG  "lispd.conf"
 
-/* LISP map-cache entry timeout (seconds). */
-#define LISP_MAP_CACHE_TTL_DEFAULT  60
+/*
+ * Map-cache default TTL in minutes (RFC 9301 §6.2: TTL field is in minutes).
+ * A value of 0 means "remove from cache immediately" (do not store).
+ * A value of 0xffffffff means "store indefinitely".
+ */
+#define LISP_MAP_CACHE_TTL_DEFAULT    1440  /* 24 hours in minutes */
+#define LISP_MAP_CACHE_TTL_PERMANENT  0xffffffff
 
-/* LISP RLOC probe interval (seconds). */
+/* How many seconds before TTL expiry to send a refresh Map-Request. */
+#define LISP_MAP_CACHE_REFRESH_SECS   60
+
+/* RLOC probe interval (seconds). */
 #define LISP_RLOC_PROBE_INTERVAL    30
 
-/* LISP message types (RFC 6830 section 6). */
+/* Default Map-Register interval (seconds, RFC 9301 §8.2). */
+#define LISP_MAP_REGISTER_DEFAULT_INTERVAL  60
+
+/* LISP message type codes (RFC 9301 §6). */
 #define LISP_MAP_REQUEST     1
 #define LISP_MAP_REPLY       2
 #define LISP_MAP_REGISTER    3
@@ -53,18 +66,58 @@
 #define LISP_AFI_IPV4        1
 #define LISP_AFI_IPV6        2
 
-/* LISP action codes for negative map replies. */
+/*
+ * Action codes for negative Map-Reply (RFC 9301 §6.2).
+ *  0 = No-Action           : no special action, use normal forwarding
+ *  1 = Natively-Forward    : forward the packet natively (non-LISP)
+ *  2 = Send-Map-Request    : resend a Map-Request before forwarding
+ *  3 = Drop                : drop the packet silently
+ */
 #define LISP_ACTION_NO_ACTION        0
 #define LISP_ACTION_NATIVELY_FORWARD 1
 #define LISP_ACTION_SEND_MAP_REQUEST 2
 #define LISP_ACTION_DROP             3
 
-/* LISP RLOC record structure. */
+/* Nonce size in octets (RFC 9301 §6.1.2: 64-bit nonce). */
+#define LISP_NONCE_LEN  8
+
+/* -------------------------------------------------------------------------
+ * Pending Map-Request (nonce tracking, RFC 9301 §6.1.2)
+ *
+ * The ITR keeps a table of outstanding Map-Requests indexed by nonce.
+ * When a Map-Reply arrives its nonce is matched against this table to
+ * identify which EID triggered the request.
+ * ---------------------------------------------------------------------- */
+
+struct lisp_pending_req {
+	/* 64-bit nonce identifying this request. */
+	uint8_t nonce[LISP_NONCE_LEN];
+
+	/* EID we queried for. */
+	struct prefix eid;
+
+	/* RLOC of the Map-Resolver / ETR we sent to. */
+	struct prefix dst;
+
+	/* Retry counter (RFC 9301 does not mandate retries but allows them). */
+	int retries;
+
+	/* Retry/timeout thread. */
+	struct thread *t_timeout;
+
+	/* Back-pointer to LISP instance. */
+	struct lisp *lisp;
+};
+
+/* -------------------------------------------------------------------------
+ * RLOC record
+ * ---------------------------------------------------------------------- */
+
 struct lisp_rloc {
 	/* RLOC address. */
 	struct prefix rloc_addr;
 
-	/* Priority (lower = preferred). */
+	/* Priority (lower = preferred, RFC 9301 §6.2). */
 	uint8_t priority;
 
 	/* Weight for load balancing. */
@@ -76,35 +129,50 @@ struct lisp_rloc {
 	/* Multicast weight. */
 	uint8_t mweight;
 
-	/* RLOC reachability flag. */
+	/*
+	 * L-bit: RLOC is a local (directly connected) address (RFC 9301 §6.2).
+	 * R-bit: RLOC is reachable.
+	 */
+	bool local;
 	bool reachable;
 };
 
-/* LISP map-cache entry. */
+/* -------------------------------------------------------------------------
+ * Map-cache entry
+ * ---------------------------------------------------------------------- */
+
 struct lisp_map_entry {
 	/* EID prefix this entry covers. */
 	struct prefix eid_prefix;
 
-	/* List of RLOCs for this EID. */
+	/* List of RLOCs for this EID (empty for negative entries). */
 	struct list *rloc_list;
 
-	/* TTL in minutes (0 = do not cache). */
+	/*
+	 * TTL in minutes (RFC 9301 §6.2).
+	 *   0          = entry MUST NOT be cached (negative, immediate evict)
+	 *   0xffffffff = store indefinitely
+	 *   other      = expire after ttl minutes
+	 */
 	uint32_t ttl;
 
 	/* Map-version number. */
 	uint16_t map_version;
 
-	/* Action code (for negative entries). */
+	/* Action code for negative entries (LISP_ACTION_*). */
 	uint8_t action;
 
-	/* Expiry thread. */
+	/* Expiry / refresh thread. */
 	struct thread *t_expire;
 
 	/* Route node backpointer. */
 	struct route_node *rn;
 };
 
-/* LISP Map-Server / Map-Resolver configuration entry. */
+/* -------------------------------------------------------------------------
+ * Map-Server / Map-Resolver configuration entry
+ * ---------------------------------------------------------------------- */
+
 struct lisp_ms_mr {
 	/* Address of the Map-Server or Map-Resolver. */
 	struct prefix addr;
@@ -115,11 +183,14 @@ struct lisp_ms_mr {
 	/* Use this entry as Map-Resolver. */
 	bool map_resolver;
 
-	/* Use proxy map-reply. */
+	/* Request proxy Map-Reply from Map-Server (P bit in Map-Register). */
 	bool proxy_reply;
 };
 
-/* Per-VRF LISP instance. */
+/* -------------------------------------------------------------------------
+ * Per-VRF LISP instance
+ * ---------------------------------------------------------------------- */
+
 struct lisp {
 	/* VRF name. */
 	char *vrf_name;
@@ -142,13 +213,30 @@ struct lisp {
 	/* Map-Server / Map-Resolver list. */
 	struct list *ms_mr_list;
 
+	/*
+	 * Pending Map-Requests keyed by nonce (first 8 bytes treated as
+	 * a uint64 for hashing).
+	 */
+	struct hash *pending_requests;
+
+	/* Authentication keys (list of struct lisp_auth_key *). */
+	struct list *auth_keys;
+
+	/*
+	 * xTR-ID (128 bits) and Site-ID (64 bits).
+	 * Set when the operator configures an xTR identity (I-bit, RFC 9301 §8.2).
+	 */
+	uint8_t xtr_id[16];
+	uint8_t site_id[8];
+	bool    id_configured;
+
 	/* Map-Register interval (seconds). */
 	uint32_t map_register_interval;
 
 	/* RLOC probe interval (seconds). */
 	uint32_t rloc_probe_interval;
 
-	/* Map-Register thread. */
+	/* Map-Register periodic thread. */
 	struct thread *t_map_register;
 
 	/* Read thread on control socket. */
@@ -167,7 +255,10 @@ struct lisp {
 	struct distribute_ctx *distribute_ctx;
 };
 
-/* LISP-specific interface state. */
+/* -------------------------------------------------------------------------
+ * LISP-specific interface state
+ * ---------------------------------------------------------------------- */
+
 struct lisp_interface {
 	/* Parent LISP instance. */
 	struct lisp *lisp;
@@ -175,14 +266,17 @@ struct lisp_interface {
 	/* LISP is enabled on this interface. */
 	bool enabled;
 
-	/* This interface is an ETR (Egress Tunnel Router). */
+	/* This interface acts as an ETR (Egress Tunnel Router). */
 	bool etr;
 
-	/* This interface is an ITR (Ingress Tunnel Router). */
+	/* This interface acts as an ITR (Ingress Tunnel Router). */
 	bool itr;
 };
 
-/* Prototypes. */
+/* -------------------------------------------------------------------------
+ * Prototypes
+ * ---------------------------------------------------------------------- */
+
 extern void lisp_init(void);
 extern void lisp_clean(struct lisp *lisp);
 extern void lisp_vrf_init(void);
@@ -191,6 +285,44 @@ extern struct lisp *lisp_lookup_by_vrf_id(vrf_id_t vrf_id);
 extern struct lisp *lisp_lookup_by_vrf_name(const char *vrf_name);
 extern struct lisp *lisp_create(const char *vrf_name, struct vrf *vrf,
 				int socket);
+
+/* Map-cache */
+extern void lisp_map_cache_add(struct lisp *lisp, struct prefix *eid,
+			       struct lisp_rloc *rloc, uint32_t ttl,
+			       uint8_t action);
+extern void lisp_map_cache_delete(struct lisp *lisp, struct prefix *eid);
+extern struct lisp_map_entry *lisp_map_cache_lookup(struct lisp *lisp,
+						    const struct prefix *eid);
+
+/* Nonce management */
+extern void lisp_nonce_generate(uint8_t nonce[LISP_NONCE_LEN]);
+extern struct lisp_pending_req *
+lisp_pending_req_add(struct lisp *lisp, const struct prefix *eid,
+		     const struct prefix *dst, const uint8_t nonce[LISP_NONCE_LEN]);
+extern struct lisp_pending_req *
+lisp_pending_req_lookup(struct lisp *lisp, const uint8_t nonce[LISP_NONCE_LEN]);
+extern void lisp_pending_req_delete(struct lisp *lisp,
+				    struct lisp_pending_req *req);
+
+/* Auth-key helpers */
+extern struct lisp_auth_key *lisp_auth_key_get(struct lisp *lisp,
+					       uint16_t key_id);
+
+/* ITR: send a Map-Request for an EID via all configured Map-Resolvers */
+extern void lisp_send_map_request(struct lisp *lisp, const struct prefix *eid);
+
+/* ETR: send Map-Register to all configured Map-Servers */
+extern void lisp_send_map_register(struct lisp *lisp);
+
+/* ETR: send a Map-Reply to a requesting ITR */
+extern void lisp_send_map_reply(struct lisp *lisp,
+				const struct prefix *eid,
+				const struct sockaddr_storage *dst,
+				const uint8_t nonce[LISP_NONCE_LEN],
+				bool probe);
+
+/* Packet I/O dispatch (called from t_read thread) */
+extern int lisp_recv_packet(struct thread *t);
 
 extern void lisp_if_init(void);
 extern void lisp_zclient_init(struct thread_master *master);
