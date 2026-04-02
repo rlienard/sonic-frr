@@ -1,4 +1,4 @@
-/* LISP <-> Zebra integration.
+/* LISP <-> Zebra integration (RFC 9301).
  * Copyright (C) 2024 FRR Project
  *
  * This file is part of FRRouting.
@@ -33,6 +33,7 @@
 #include "lispd/lispd.h"
 #include "lispd/lisp_interface.h"
 #include "lispd/lisp_memory.h"
+#include "lispd/lisp_debug.h"
 
 /* Zebra client handle. */
 static struct zclient *zclient = NULL;
@@ -121,10 +122,48 @@ static int lisp_interface_address_delete(int command, struct zclient *zclient,
 }
 
 /* -------------------------------------------------------------------------
+ * ITR cache-miss hook (RFC 9301 §5.2)
+ *
+ * Zebra notifies us when a route lookup for a destination EID fails.
+ * The ITR MUST send a Map-Request to resolve the EID-to-RLOC mapping.
+ * ---------------------------------------------------------------------- */
+
+static int lisp_route_notify_owner(int command, struct zclient *zclient,
+				   zebra_size_t length, vrf_id_t vrf_id)
+{
+	struct prefix p;
+	enum zapi_route_notify_owner note;
+	uint32_t table_id;
+	struct lisp *lisp;
+
+	if (!zapi_route_notify_decode(zclient->ibuf, &p, &table_id, &note))
+		return -1;
+
+	lisp = lisp_lookup_by_vrf_id(vrf_id);
+	if (!lisp || !lisp->enabled)
+		return 0;
+
+	/*
+	 * ZAPI_ROUTE_FAIL_INSTALL means Zebra could not install the route
+	 * (cache miss).  The ITR MUST send a Map-Request (RFC 9301 §5.2).
+	 */
+	if (note == ZAPI_ROUTE_FAIL_INSTALL) {
+		if (IS_LISP_DEBUG_ZEBRA) {
+			char buf[PREFIX2STR_BUFFER];
+			prefix2str(&p, buf, sizeof(buf));
+			zlog_debug("LISP: cache miss for %s, sending Map-Request",
+				   buf);
+		}
+		lisp_send_map_request(lisp, &p);
+	}
+
+	return 0;
+}
+
+/* -------------------------------------------------------------------------
  * Route install / withdraw helpers
  * ---------------------------------------------------------------------- */
 
-/* Install a resolved LISP EID route into the kernel via Zebra. */
 void lisp_zebra_route_add(struct lisp *lisp, struct prefix *eid,
 			  struct nexthop *nh)
 {
@@ -133,8 +172,8 @@ void lisp_zebra_route_add(struct lisp *lisp, struct prefix *eid,
 
 	memset(&api, 0, sizeof(api));
 	api.vrf_id = lisp->vrf ? lisp->vrf->vrf_id : VRF_DEFAULT;
-	api.type = ZEBRA_ROUTE_LISP;
-	api.safi = SAFI_UNICAST;
+	api.type   = ZEBRA_ROUTE_LISP;
+	api.safi   = SAFI_UNICAST;
 	memcpy(&api.prefix, eid, sizeof(*eid));
 
 	SET_FLAG(api.message, ZAPI_MESSAGE_NEXTHOP);
@@ -145,12 +184,12 @@ void lisp_zebra_route_add(struct lisp *lisp, struct prefix *eid,
 
 	if (nh->type == NEXTHOP_TYPE_IPV4
 	    || nh->type == NEXTHOP_TYPE_IPV4_IFINDEX) {
-		api_nh->type = NEXTHOP_TYPE_IPV4;
-		api_nh->gate.ipv4 = nh->gate.ipv4;
+		api_nh->type       = NEXTHOP_TYPE_IPV4;
+		api_nh->gate.ipv4  = nh->gate.ipv4;
 	} else if (nh->type == NEXTHOP_TYPE_IPV6
 		   || nh->type == NEXTHOP_TYPE_IPV6_IFINDEX) {
-		api_nh->type = NEXTHOP_TYPE_IPV6;
-		api_nh->gate.ipv6 = nh->gate.ipv6;
+		api_nh->type       = NEXTHOP_TYPE_IPV6;
+		api_nh->gate.ipv6  = nh->gate.ipv6;
 	} else {
 		return;
 	}
@@ -158,15 +197,14 @@ void lisp_zebra_route_add(struct lisp *lisp, struct prefix *eid,
 	zclient_route_send(ZEBRA_ROUTE_ADD, zclient, &api);
 }
 
-/* Withdraw a previously installed LISP EID route from Zebra. */
 void lisp_zebra_route_delete(struct lisp *lisp, struct prefix *eid)
 {
 	struct zapi_route api;
 
 	memset(&api, 0, sizeof(api));
 	api.vrf_id = lisp->vrf ? lisp->vrf->vrf_id : VRF_DEFAULT;
-	api.type = ZEBRA_ROUTE_LISP;
-	api.safi = SAFI_UNICAST;
+	api.type   = ZEBRA_ROUTE_LISP;
+	api.safi   = SAFI_UNICAST;
 	memcpy(&api.prefix, eid, sizeof(*eid));
 
 	zclient_route_send(ZEBRA_ROUTE_DELETE, zclient, &api);
@@ -191,11 +229,12 @@ void lisp_zclient_init(struct thread_master *master)
 	zclient = zclient_new(master, &zclient_options_default);
 	zclient_init(zclient, ZEBRA_ROUTE_LISP, 0, &lispd_privs);
 
-	zclient->zebra_connected = lisp_zebra_connected;
-	zclient->interface_add = lisp_interface_add;
-	zclient->interface_delete = lisp_interface_delete;
-	zclient->interface_up = lisp_interface_up;
-	zclient->interface_down = lisp_interface_down;
-	zclient->interface_address_add = lisp_interface_address_add;
+	zclient->zebra_connected        = lisp_zebra_connected;
+	zclient->interface_add          = lisp_interface_add;
+	zclient->interface_delete       = lisp_interface_delete;
+	zclient->interface_up           = lisp_interface_up;
+	zclient->interface_down         = lisp_interface_down;
+	zclient->interface_address_add  = lisp_interface_address_add;
 	zclient->interface_address_delete = lisp_interface_address_delete;
+	zclient->route_notify_owner     = lisp_route_notify_owner;
 }
