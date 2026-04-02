@@ -119,6 +119,29 @@ DEFUN(no_debug_lisp_mapcache,
 	return CMD_SUCCESS;
 }
 
+DEFUN(debug_lisp_pubsub,
+      debug_lisp_pubsub_cmd,
+      "debug lisp pubsub",
+      DEBUG_STR
+      "LISP information\n"
+      "LISP publish/subscribe (RFC 9437) operations\n")
+{
+	lisp_debug_flags |= LISP_DEBUG_PUBSUB;
+	return CMD_SUCCESS;
+}
+
+DEFUN(no_debug_lisp_pubsub,
+      no_debug_lisp_pubsub_cmd,
+      "no debug lisp pubsub",
+      NO_STR
+      DEBUG_STR
+      "LISP information\n"
+      "LISP publish/subscribe (RFC 9437) operations\n")
+{
+	lisp_debug_flags &= ~LISP_DEBUG_PUBSUB;
+	return CMD_SUCCESS;
+}
+
 void lisp_debug_init(void)
 {
 	install_element(ENABLE_NODE, &debug_lisp_events_cmd);
@@ -138,4 +161,9 @@ void lisp_debug_init(void)
 	install_element(CONFIG_NODE, &no_debug_lisp_zebra_cmd);
 	install_element(CONFIG_NODE, &debug_lisp_mapcache_cmd);
 	install_element(CONFIG_NODE, &no_debug_lisp_mapcache_cmd);
+
+	install_element(ENABLE_NODE, &debug_lisp_pubsub_cmd);
+	install_element(ENABLE_NODE, &no_debug_lisp_pubsub_cmd);
+	install_element(CONFIG_NODE, &debug_lisp_pubsub_cmd);
+	install_element(CONFIG_NODE, &no_debug_lisp_pubsub_cmd);
 }

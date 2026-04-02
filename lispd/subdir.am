@@ -9,6 +9,7 @@ dist_examples_DATA += lispd/lispd.conf.sample
 vtysh_scan += \
 	$(top_srcdir)/lispd/lisp_cli.c \
 	$(top_srcdir)/lispd/lisp_debug.c \
+	$(top_srcdir)/lispd/lisp_pubsub.c \
 	$(top_srcdir)/lispd/lispd.c \
 	# end
 
@@ -23,6 +24,7 @@ lispd_liblisp_a_SOURCES = \
 	lispd/lisp_interface.c \
 	lispd/lisp_memory.c \
 	lispd/lisp_packet.c \
+	lispd/lisp_pubsub.c \
 	lispd/lisp_zebra.c \
 	lispd/lispd.c \
 	# end
@@ -35,6 +37,7 @@ noinst_HEADERS += \
 	lispd/lisp_interface.h \
 	lispd/lisp_memory.h \
 	lispd/lisp_packet.h \
+	lispd/lisp_pubsub.h \
 	lispd/lispd.h \
 	# end
 

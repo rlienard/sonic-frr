@@ -60,6 +60,7 @@
 #define LISP_MAP_REPLY       2
 #define LISP_MAP_REGISTER    3
 #define LISP_MAP_NOTIFY      4
+#define LISP_MAP_NOTIFY_ACK  5   /* RFC 9437 §5 */
 #define LISP_ENCAP_CONTROL   8
 
 /* LISP AFI values. */
@@ -188,6 +189,17 @@ struct lisp_ms_mr {
 };
 
 /* -------------------------------------------------------------------------
+ * Map-Notify-Ack (RFC 9437 §5)
+ *
+ * Sent by a subscriber in response to a Map-Notify publication to
+ * acknowledge receipt.  The nonce echoes the Map-Notify nonce.
+ * ---------------------------------------------------------------------- */
+
+struct lisp_map_notify_ack {
+	uint8_t nonce[LISP_NONCE_LEN];
+};
+
+/* -------------------------------------------------------------------------
  * Per-VRF LISP instance
  * ---------------------------------------------------------------------- */
 
@@ -235,6 +247,17 @@ struct lisp {
 
 	/* RLOC probe interval (seconds). */
 	uint32_t rloc_probe_interval;
+
+	/*
+	 * RFC 9437 pub/sub state.
+	 *
+	 * subscriptions: Map-Server side — one struct lisp_subscription per
+	 *                (EID-prefix, xTR-ID) pair.
+	 * sub_states:    Subscriber (xTR) side — one struct lisp_sub_state per
+	 *                EID-prefix we have subscribed to.
+	 */
+	struct list *subscriptions;
+	struct list *sub_states;
 
 	/* Map-Register periodic thread. */
 	struct thread *t_map_register;
@@ -320,6 +343,17 @@ extern void lisp_send_map_reply(struct lisp *lisp,
 				const struct sockaddr_storage *dst,
 				const uint8_t nonce[LISP_NONCE_LEN],
 				bool probe);
+
+/* MS: send a Map-Notify for an EID to a specific destination RLOC */
+extern void lisp_send_map_notify(struct lisp *lisp,
+				 const struct prefix *eid,
+				 const struct prefix *dst_rloc,
+				 uint64_t nonce);
+
+/* xTR: send Map-Notify-Ack echoing the given nonce back to src */
+extern void lisp_send_map_notify_ack(struct lisp *lisp,
+				     const uint8_t nonce[LISP_NONCE_LEN],
+				     const struct sockaddr_storage *dst);
 
 /* Packet I/O dispatch (called from t_read thread) */
 extern int lisp_recv_packet(struct thread *t);

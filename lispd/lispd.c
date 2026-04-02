@@ -40,6 +40,7 @@
 #include "lispd/lisp_debug.h"
 #include "lispd/lisp_packet.h"
 #include "lispd/lisp_auth.h"
+#include "lispd/lisp_pubsub.h"
 
 DEFINE_HOOK(lisp_ifaddr_add, (struct connected *ifc), (ifc))
 DEFINE_HOOK(lisp_ifaddr_del, (struct connected *ifc), (ifc))
@@ -628,6 +629,118 @@ static int lisp_map_register_timer(struct thread *t)
 }
 
 /* =========================================================================
+ * Map-Notify / Map-Notify-Ack senders (RFC 9437)
+ * ====================================================================== */
+
+/*
+ * Map-Server role: send a Map-Notify for an EID to a specific destination.
+ * The nonce is provided by the caller (usually the subscription nonce).
+ */
+void lisp_send_map_notify(struct lisp *lisp,
+			  const struct prefix *eid,
+			  const struct prefix *dst_rloc,
+			  uint64_t nonce)
+{
+	struct lisp_map_notify notify;
+	struct lisp_map_entry *me;
+	struct lisp_auth_key *key;
+	struct sockaddr_in sin;
+	struct stream *s;
+
+	if (!dst_rloc || dst_rloc->family != AF_INET)
+		return;
+
+	memset(&notify, 0, sizeof(notify));
+	{
+		uint64_t n = htobe64(nonce);
+		memcpy(notify.nonce, &n, LISP_NONCE_LEN);
+	}
+
+	me = lisp_map_cache_lookup(lisp, eid);
+	notify.record_count         = 1;
+	notify.records[0].eid_prefix = *eid;
+
+	if (me) {
+		struct listnode *node;
+		struct lisp_rloc *rloc;
+
+		notify.records[0].ttl           = me->ttl;
+		notify.records[0].action        = me->action;
+		notify.records[0].authoritative = true;
+
+		for (ALL_LIST_ELEMENTS_RO(me->rloc_list, node, rloc)) {
+			struct lisp_loc_record *lr;
+
+			if (notify.records[0].loc_count >= 32)
+				break;
+			lr = &notify.records[0].locs[notify.records[0].loc_count++];
+			lr->priority  = rloc->priority;
+			lr->weight    = rloc->weight;
+			lr->mpriority = rloc->mpriority;
+			lr->mweight   = rloc->mweight;
+			lr->flags     = (rloc->local     ? LISP_LOC_FLAG_L : 0)
+					| (rloc->reachable ? LISP_LOC_FLAG_R : 0);
+			lr->rloc      = rloc->rloc_addr;
+		}
+	} else {
+		notify.records[0].ttl    = LISP_PUBSUB_DEFAULT_NEG_TTL_MINS;
+		notify.records[0].action = LISP_ACTION_NATIVELY_FORWARD;
+	}
+
+	key = lisp_auth_key_get(lisp, notify.key_id);
+
+	s = stream_new(LISP_MAX_PACKET_SIZE);
+	if (lisp_encode_map_notify(s, &notify, key) < 0) {
+		stream_free(s);
+		return;
+	}
+
+	memset(&sin, 0, sizeof(sin));
+	sin.sin_family = AF_INET;
+	sin.sin_port   = htons(LISP_CONTROL_PORT);
+	sin.sin_addr   = dst_rloc->u.prefix4;
+
+	sendto(lisp->sock, STREAM_DATA(s), stream_get_endp(s), 0,
+	       (struct sockaddr *)&sin, sizeof(sin));
+	stream_free(s);
+}
+
+/*
+ * Subscriber role: send a Map-Notify-Ack echoing the nonce back to src.
+ */
+void lisp_send_map_notify_ack(struct lisp *lisp,
+			      const uint8_t nonce[LISP_NONCE_LEN],
+			      const struct sockaddr_storage *dst)
+{
+	struct lisp_map_notify_ack ack;
+	struct sockaddr_in sin;
+	struct stream *s;
+
+	if (dst->ss_family != AF_INET)
+		return;
+
+	memcpy(ack.nonce, nonce, LISP_NONCE_LEN);
+
+	s = stream_new(LISP_MAX_PACKET_SIZE);
+	if (lisp_encode_map_notify_ack(s, &ack) < 0) {
+		stream_free(s);
+		return;
+	}
+
+	memset(&sin, 0, sizeof(sin));
+	sin.sin_family = AF_INET;
+	sin.sin_port   = htons(LISP_CONTROL_PORT);
+	sin.sin_addr   = ((const struct sockaddr_in *)dst)->sin_addr;
+
+	sendto(lisp->sock, STREAM_DATA(s), stream_get_endp(s), 0,
+	       (struct sockaddr *)&sin, sizeof(sin));
+	stream_free(s);
+
+	if (IS_LISP_DEBUG_PUBSUB)
+		zlog_debug("LISP pubsub: sent Map-Notify-Ack");
+}
+
+/* =========================================================================
  * Incoming packet handlers
  * ====================================================================== */
 
@@ -693,11 +806,13 @@ static void lisp_handle_map_reply(struct lisp *lisp, struct stream *s)
 	lisp_pending_req_delete(lisp, pending);
 }
 
-/* Handle a received Map-Request (RFC 9301 §6.1) — ETR role. */
+/* Handle a received Map-Request (RFC 9301 §6.1) — ETR / Map-Server role. */
 static void lisp_handle_map_request(struct lisp *lisp, struct stream *s,
 				    struct sockaddr_storage *src)
 {
 	struct lisp_map_request req;
+	bool any_subscribe = false;
+	bool any_unsubscribe = false;
 	int i;
 
 	if (lisp_decode_map_request(s, &req) < 0) {
@@ -705,6 +820,30 @@ static void lisp_handle_map_request(struct lisp *lisp, struct stream *s,
 		return;
 	}
 
+	/*
+	 * RFC 9437 §4.1: detect pub/sub requests.
+	 * An AFI=0 ITR-RLOC with N-bit set signals unsubscription.
+	 */
+	for (i = 0; i < req.record_count && i < 8; i++) {
+		if (!req.records[i].subscribe_n)
+			continue;
+		if (req.itr_rloc_count > 0 && req.itr_rlocs[0].family == 0)
+			any_unsubscribe = true;
+		else
+			any_subscribe = true;
+	}
+
+	if (any_unsubscribe) {
+		lisp_pubsub_handle_unsubscribe(lisp, &req, src);
+		return;
+	}
+
+	if (any_subscribe) {
+		lisp_pubsub_handle_subscribe(lisp, &req, src);
+		return;
+	}
+
+	/* Normal Map-Request: answer with a Map-Reply if we own the EID. */
 	for (i = 0; i < req.record_count; i++) {
 		struct prefix *queried = &req.records[i].eid_prefix;
 		struct route_node *rn;
@@ -729,8 +868,9 @@ static void lisp_handle_map_request(struct lisp *lisp, struct stream *s,
 	}
 }
 
-/* Handle a received Map-Notify (RFC 9301 §8.4) — ETR role. */
-static void lisp_handle_map_notify(struct lisp *lisp, struct stream *s)
+/* Handle a received Map-Notify (RFC 9301 §8.4) — ETR / subscriber role. */
+static void lisp_handle_map_notify(struct lisp *lisp, struct stream *s,
+				   struct sockaddr_storage *src)
 {
 	struct lisp_map_notify notify;
 	struct lisp_auth_key *key;
@@ -743,22 +883,42 @@ static void lisp_handle_map_notify(struct lisp *lisp, struct stream *s)
 	/* Verify HMAC authentication. */
 	key = lisp_auth_key_get(lisp, notify.key_id);
 	if (key) {
-		/*
-		 * Re-read raw bytes from the stream for verification.
-		 * The stream has been consumed; the caller must pass raw
-		 * buf/len — here we trust the decode succeeded and log only.
-		 */
 		if (IS_LISP_DEBUG_EVENTS)
 			zlog_debug("LISP: Map-Notify received (key-id %u)",
 				   notify.key_id);
-	} else {
+	} else if (notify.key_id != 0) {
 		zlog_warn("LISP: Map-Notify with unknown key-id %u",
 			  notify.key_id);
 	}
 
 	if (IS_LISP_DEBUG_EVENTS)
-		zlog_debug("LISP: Map-Notify ACK for %u EID(s)",
-			   notify.record_count);
+		zlog_debug("LISP: Map-Notify for %u EID(s)", notify.record_count);
+
+	/*
+	 * If we have active subscriptions for any of the EIDs in this
+	 * Map-Notify, route to the pub/sub handler (RFC 9437 §5).
+	 * Otherwise this is a registration confirmation and no further
+	 * action is needed here (the ETR has already sent Map-Register).
+	 */
+	lisp_pubsub_handle_notify(lisp, &notify, src);
+}
+
+/*
+ * Handle incoming Map-Notify-Ack (RFC 9437 §5) — Map-Server role.
+ * The subscriber is acknowledging a Map-Notify publication we sent.
+ */
+static void lisp_handle_map_notify_ack(struct lisp *lisp, struct stream *s,
+				       struct sockaddr_storage *src)
+{
+	struct lisp_map_notify_ack ack;
+
+	if (lisp_decode_map_notify_ack(s, &ack) < 0) {
+		flog_err(EC_LISP_PACKET,
+			 "LISP: failed to decode Map-Notify-Ack");
+		return;
+	}
+
+	lisp_pubsub_handle_notify_ack(lisp, &ack, src);
 }
 
 /* Handle an incoming ECM (type 8) — Map-Resolver forwards Map-Request. */
@@ -821,7 +981,10 @@ int lisp_recv_packet(struct thread *t)
 			zlog_debug("LISP: ignoring Map-Register (not MS)");
 		break;
 	case LISP_MAP_NOTIFY:
-		lisp_handle_map_notify(lisp, s);
+		lisp_handle_map_notify(lisp, s, &src);
+		break;
+	case LISP_MAP_NOTIFY_ACK:
+		lisp_handle_map_notify_ack(lisp, s, &src);
 		break;
 	case LISP_ENCAP_CONTROL:
 		lisp_handle_ecm(lisp, s, &src);
@@ -865,6 +1028,10 @@ struct lisp *lisp_create(const char *vrf_name, struct vrf *vrf, int socket)
 	lisp->pending_requests = hash_create(lisp_pending_req_hash,
 					     lisp_pending_req_cmp,
 					     "LISP pending requests");
+
+	/* RFC 9437 pub/sub state lists. */
+	lisp->subscriptions = list_new();
+	lisp->sub_states    = list_new();
 
 	if (vrf)
 		vrf->info = lisp;
@@ -929,6 +1096,20 @@ void lisp_clean(struct lisp *lisp)
 	/* Clean pending requests. */
 	hash_clean(lisp->pending_requests, lisp_pending_req_free);
 	hash_free(lisp->pending_requests);
+
+	/* Clean pub/sub state (RFC 9437). */
+	lisp_pubsub_clean(lisp);
+	list_delete(&lisp->subscriptions);
+	{
+		struct listnode *snode, *snnode;
+		struct lisp_sub_state *ss;
+
+		for (ALL_LIST_ELEMENTS(lisp->sub_states, snode, snnode, ss)) {
+			THREAD_OFF(ss->t_refresh);
+			XFREE(MTYPE_LISP_SUB_STATE, ss);
+		}
+		list_delete(&lisp->sub_states);
+	}
 
 	if (lisp->sock >= 0)
 		close(lisp->sock);

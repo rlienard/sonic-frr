@@ -71,7 +71,7 @@ struct lisp_eid_record {
 	struct lisp_loc_record locs[32]; /* up to 32 RLOCs per record */
 };
 
-/* Decoded Map-Request (RFC 9301 §6.1). */
+/* Decoded Map-Request (RFC 9301 §6.1, extended by RFC 9437 for pub/sub). */
 struct lisp_map_request {
 	/* Header flags */
 	bool     authoritative;   /* A bit */
@@ -80,6 +80,12 @@ struct lisp_map_request {
 	bool     smr;             /* S bit (Solicit Map-Request) */
 	bool     pitr;            /* p bit */
 	bool     smr_invoked;     /* s bit */
+
+	/*
+	 * I-bit (RFC 9437 §4.1): xTR-ID and Site-ID present at end of message.
+	 * Set when the xTR includes its identity for subscription keying.
+	 */
+	bool     id_present;      /* I bit */
 
 	uint8_t  itr_rloc_count;  /* number of ITR-RLOCs (value+1 in wire) */
 	uint8_t  record_count;
@@ -92,7 +98,20 @@ struct lisp_map_request {
 	/* Requested EID records */
 	struct {
 		struct prefix eid_prefix;
+		/*
+		 * N-bit (RFC 9437 §4.1): subscribe to mapping updates for
+		 * this EID-prefix.  Set in the per-record reserved byte.
+		 */
+		bool subscribe_n;
 	} records[8];
+
+	/*
+	 * xTR-ID (128 bits) and Site-ID (64 bits).
+	 * Present in wire format after records when id_present is true
+	 * (RFC 9437 §4.1).
+	 */
+	uint8_t  xtr_id[16];
+	uint8_t  site_id[8];
 };
 
 /* Decoded Map-Reply (RFC 9301 §6.2). */
@@ -138,6 +157,18 @@ struct lisp_map_notify {
 	uint8_t  auth_data[LISP_AUTH_SHA256_128_LEN];
 
 	struct lisp_eid_record records[8];
+};
+
+/*
+ * Decoded Map-Notify-Ack (RFC 9437 §5).
+ *
+ * Wire layout:
+ *   1 byte   type(4b)=5 | reserved(4b)
+ *   3 bytes  reserved
+ *   8 bytes  Nonce   (echoes the Map-Notify nonce)
+ */
+struct lisp_map_notify_ack {
+	uint8_t nonce[LISP_NONCE_LEN];
 };
 
 /* -----------------------------------------------------------------------
@@ -190,5 +221,11 @@ extern int lisp_decode_map_notify(struct stream *s,
 
 /* Decode an ECM outer header and advance s to the inner Map-Request. */
 extern int lisp_decode_ecm(struct stream *s);
+
+/* Map-Notify-Ack (RFC 9437 §5). */
+extern int lisp_encode_map_notify_ack(struct stream *s,
+				      const struct lisp_map_notify_ack *ack);
+extern int lisp_decode_map_notify_ack(struct stream *s,
+				      struct lisp_map_notify_ack *ack);
 
 #endif /* _LISP_PACKET_H */
