@@ -30,11 +30,13 @@ extern unsigned long lisp_debug_flags;
 #define LISP_DEBUG_PACKET   0x02
 #define LISP_DEBUG_ZEBRA    0x04
 #define LISP_DEBUG_MAPCACHE 0x08
+#define LISP_DEBUG_PUBSUB   0x10  /* RFC 9437 publish/subscribe */
 
 #define IS_LISP_DEBUG_EVENTS   (lisp_debug_flags & LISP_DEBUG_EVENTS)
 #define IS_LISP_DEBUG_PACKET   (lisp_debug_flags & LISP_DEBUG_PACKET)
 #define IS_LISP_DEBUG_ZEBRA    (lisp_debug_flags & LISP_DEBUG_ZEBRA)
 #define IS_LISP_DEBUG_MAPCACHE (lisp_debug_flags & LISP_DEBUG_MAPCACHE)
+#define IS_LISP_DEBUG_PUBSUB   (lisp_debug_flags & LISP_DEBUG_PUBSUB)
 
 extern void lisp_debug_init(void);
 

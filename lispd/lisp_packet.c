@@ -21,13 +21,15 @@
 /*
  * Wire format references (all section numbers are from RFC 9301):
  *
- *  Map-Request  §6.1   type=1
- *  Map-Reply    §6.2   type=2
- *  Map-Register §8.2   type=3
- *  Map-Notify   §8.4   type=4
- *  ECM          §6.4   type=8
+ *  Map-Request      §6.1   type=1
+ *  Map-Reply        §6.2   type=2
+ *  Map-Register     §8.2   type=3
+ *  Map-Notify       §8.4   type=4
+ *  Map-Notify-Ack   RFC 9437 §5   type=5
+ *  ECM              §6.4   type=8
  *
  * EID-Record and Locator (RLOC) sub-format §6.1 / §6.2.
+ * Pub/Sub extensions (N-bit, I-bit): RFC 9437 §4.1.
  *
  * All multi-byte fields are big-endian (network byte order).
  */
@@ -223,8 +225,13 @@ int lisp_encode_map_request(struct stream *s,
 		| (req->probe            ? 0x02 : 0)
 		| (req->smr              ? 0x01 : 0);
 
+	/*
+	 * byte2: p(1)|s(1)|I(1)|reserved(5)
+	 * I-bit (RFC 9437 §4.1): xTR-ID + Site-ID present after records.
+	 */
 	byte2 = (req->pitr        ? 0x80 : 0)
-		| (req->smr_invoked ? 0x40 : 0);
+		| (req->smr_invoked ? 0x40 : 0)
+		| (req->id_present  ? 0x20 : 0);
 
 	irc_rc = (((req->itr_rloc_count - 1) & 0x0f) << 4)
 		 | (req->record_count & 0x0f);
@@ -242,9 +249,19 @@ int lisp_encode_map_request(struct stream *s,
 		stream_put_prefix_afi(s, &req->itr_rlocs[i]);
 
 	for (i = 0; i < req->record_count && i < 8; i++) {
-		stream_putc(s, 0); /* reserved */
+		/*
+		 * Per-record reserved byte: N-bit in bit 7 (RFC 9437 §4.1).
+		 * N=1 means "subscribe to updates for this EID-prefix".
+		 */
+		stream_putc(s, req->records[i].subscribe_n ? 0x80 : 0x00);
 		stream_putc(s, req->records[i].eid_prefix.prefixlen);
 		stream_put_prefix_afi(s, &req->records[i].eid_prefix);
+	}
+
+	/* Append xTR-ID + Site-ID when I-bit is set (RFC 9437 §4.1). */
+	if (req->id_present) {
+		stream_put(s, req->xtr_id,  sizeof(req->xtr_id));
+		stream_put(s, req->site_id, sizeof(req->site_id));
 	}
 
 	return 0;
@@ -271,6 +288,8 @@ int lisp_decode_map_request(struct stream *s, struct lisp_map_request *req)
 	req->smr              = !!(byte1 & 0x01);
 	req->pitr             = !!(byte2 & 0x80);
 	req->smr_invoked      = !!(byte2 & 0x40);
+	/* I-bit: xTR-ID and Site-ID present (RFC 9437 §4.1) */
+	req->id_present       = !!(byte2 & 0x20);
 
 	req->itr_rloc_count = ((irc_rc >> 4) & 0x0f) + 1;
 	req->record_count   = irc_rc & 0x0f;
@@ -292,15 +311,25 @@ int lisp_decode_map_request(struct stream *s, struct lisp_map_request *req)
 		return -1;
 
 	for (i = 0; i < req->record_count; i++) {
-		uint8_t masklen;
+		uint8_t n_rsvd, masklen;
 
 		if (STREAM_READABLE(s) < 2)
 			return -1;
-		stream_getc(s); /* reserved */
+		/* N-bit is in bit 7 of the per-record reserved byte (RFC 9437 §4.1). */
+		n_rsvd = stream_getc(s);
+		req->records[i].subscribe_n = !!(n_rsvd & 0x80);
 		masklen = stream_getc(s);
 		if (stream_get_prefix_afi(s, &req->records[i].eid_prefix) < 0)
 			return -1;
 		req->records[i].eid_prefix.prefixlen = masklen;
+	}
+
+	/* Read xTR-ID + Site-ID when I-bit is set (RFC 9437 §4.1). */
+	if (req->id_present) {
+		if (STREAM_READABLE(s) < 24)
+			return -1;
+		stream_get(req->xtr_id,  s, 16);
+		stream_get(req->site_id, s,  8);
 	}
 
 	return 0;
@@ -588,6 +617,38 @@ int lisp_encode_ecm(struct stream *s,
 
 	/* Inner Map-Request */
 	return lisp_encode_map_request(s, req);
+}
+
+/* =========================================================================
+ * Map-Notify-Ack encode / decode  (RFC 9437 §5)
+ *
+ * Wire layout:
+ *   1 byte   type(4b)=5 | reserved(4b)
+ *   3 bytes  reserved
+ *   8 bytes  Nonce   (echoes the Map-Notify nonce)
+ * ====================================================================== */
+
+int lisp_encode_map_notify_ack(struct stream *s,
+			       const struct lisp_map_notify_ack *ack)
+{
+	stream_putc(s, LISP_MAP_NOTIFY_ACK << 4);
+	stream_putc(s, 0); /* reserved */
+	stream_putw(s, 0); /* reserved */
+	stream_put(s, ack->nonce, LISP_NONCE_LEN);
+	return 0;
+}
+
+int lisp_decode_map_notify_ack(struct stream *s,
+			       struct lisp_map_notify_ack *ack)
+{
+	if (STREAM_READABLE(s) < 4 + LISP_NONCE_LEN)
+		return -1;
+
+	stream_getc(s); /* type byte (caller verified type=5) */
+	stream_getc(s); /* reserved */
+	stream_getw(s); /* reserved */
+	stream_get(ack->nonce, s, LISP_NONCE_LEN);
+	return 0;
 }
 
 /*
