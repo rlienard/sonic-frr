@@ -15,6 +15,7 @@ sonic-frr/
 ├── pimd/                # PIM-SM/SSM daemon
 ├── bfdd/                # BFD daemon
 ├── ldpd/                # LDP daemon
+├── lispd/                # LISP daemon
 ├── pbrd/                # PBR daemon
 ├── staticd/             # Static route daemon
 ├── babeld/              # Babel daemon
