@@ -32,6 +32,7 @@
 #include "lispd/lisp_cli.h"
 #include "lispd/lisp_memory.h"
 #include "lispd/lisp_auth.h"
+#include "lispd/lisp_mobility.h"
 
 /* -------------------------------------------------------------------------
  * LISP router-mode node
@@ -549,6 +550,43 @@ DEFUN(show_lisp_pending,
 }
 
 /* -------------------------------------------------------------------------
+ * Map-Server role  (draft-ietf-lisp-eid-mobility-17)
+ *
+ * map-server-role
+ *   Enables the Map-Server role on this LISP instance.  Once enabled,
+ *   incoming Map-Register messages are processed: the EID-to-RLOC database
+ *   (ms_db) is updated, EID mobility is detected, SMRs are sent to cached
+ *   ITR-RLOCs, and pub/sub subscribers are notified.
+ * ---------------------------------------------------------------------- */
+
+DEFUN(lisp_map_server_role,
+      lisp_map_server_role_cmd,
+      "map-server-role",
+      "Enable Map-Server role (draft-ietf-lisp-eid-mobility-17)\n")
+{
+	VTY_DECLVAR_CONTEXT(lisp, lisp);
+
+	lisp->ms_role = true;
+	vty_out(vty, "%% Map-Server role enabled\n");
+	return CMD_SUCCESS;
+}
+
+DEFUN(no_lisp_map_server_role,
+      no_lisp_map_server_role_cmd,
+      "no map-server-role",
+      NO_STR
+      "Disable Map-Server role\n")
+{
+	VTY_DECLVAR_CONTEXT(lisp, lisp);
+
+	lisp->ms_role = false;
+	/* Clear the database when the role is disabled. */
+	lisp_mobility_ms_db_clean(lisp);
+	vty_out(vty, "%% Map-Server role disabled\n");
+	return CMD_SUCCESS;
+}
+
+/* -------------------------------------------------------------------------
  * Init
  * ---------------------------------------------------------------------- */
 
@@ -572,6 +610,10 @@ void lisp_cli_init(void)
 	install_element(LISP_NODE, &lisp_eid_prefix_cmd);
 	install_element(LISP_NODE, &no_lisp_eid_prefix_cmd);
 
+	/* EID mobility — Map-Server role toggle */
+	install_element(LISP_NODE, &lisp_map_server_role_cmd);
+	install_element(LISP_NODE, &no_lisp_map_server_role_cmd);
+
 	install_element(VIEW_NODE,   &show_lisp_map_cache_cmd);
 	install_element(VIEW_NODE,   &show_lisp_eid_table_cmd);
 	install_element(VIEW_NODE,   &show_lisp_auth_keys_cmd);
@@ -580,4 +622,7 @@ void lisp_cli_init(void)
 	install_element(ENABLE_NODE, &show_lisp_eid_table_cmd);
 	install_element(ENABLE_NODE, &show_lisp_auth_keys_cmd);
 	install_element(ENABLE_NODE, &show_lisp_pending_cmd);
+
+	/* EID mobility show commands (registered via lisp_mobility.c) */
+	lisp_mobility_cli_init();
 }

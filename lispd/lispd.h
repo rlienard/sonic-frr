@@ -298,6 +298,30 @@ struct lisp {
 	struct route_table  *sgt_table;
 	struct list         *gbp_policies;
 
+	/* ---------------------------------------------------------------
+	 * EID Mobility state (draft-ietf-lisp-eid-mobility-17)
+	 * --------------------------------------------------------------- */
+
+	/*
+	 * ms_role: when true this instance acts as a Map-Server.
+	 * Incoming Map-Register messages are processed and stored in ms_db.
+	 */
+	bool ms_role;
+
+	/*
+	 * ms_db: Map-Server EID database (struct lisp_ms_entry *).
+	 * Keyed by EID-prefix.  Only used when ms_role is true.
+	 */
+	struct route_table *ms_db;
+
+	/*
+	 * away_table: Away Table (ETR role).
+	 * Tracks EIDs that previously belonged to this ETR but have since
+	 * moved to another site.  Data traffic arriving for these EIDs
+	 * triggers SMR generation toward the source ITR.
+	 */
+	struct route_table *away_table;
+
 	/* Map-Register periodic thread. */
 	struct thread *t_map_register;
 
@@ -347,6 +371,10 @@ extern struct lisp *lisp_lookup_by_vrf_id(vrf_id_t vrf_id);
 extern struct lisp *lisp_lookup_by_vrf_name(const char *vrf_name);
 extern struct lisp *lisp_create(const char *vrf_name, struct vrf *vrf,
 				int socket);
+
+/* ITR: send an SMR-invoked Map-Request (s-bit=1) for an EID */
+extern void lisp_send_smr_invoked_request(struct lisp *lisp,
+					  const struct prefix *eid);
 
 /* Map-cache */
 extern void lisp_map_cache_add(struct lisp *lisp, struct prefix *eid,

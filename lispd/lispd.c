@@ -42,6 +42,7 @@
 #include "lispd/lisp_auth.h"
 #include "lispd/lisp_pubsub.h"
 #include "lispd/lisp_vxlan.h"
+#include "lispd/lisp_mobility.h"
 
 DEFINE_HOOK(lisp_ifaddr_add, (struct connected *ifc), (ifc))
 DEFINE_HOOK(lisp_ifaddr_del, (struct connected *ifc), (ifc))
@@ -458,6 +459,82 @@ void lisp_send_map_request(struct lisp *lisp, const struct prefix *eid)
 }
 
 /* =========================================================================
+ * SMR-invoked Map-Request sender  (ITR, draft-ietf-lisp-eid-mobility §5.2)
+ *
+ * Sends a Map-Request with the s-bit (smr_invoked) set in response to a
+ * received SMR.  Identical to lisp_send_map_request() except the
+ * smr_invoked flag is set in the encoded Map-Request header.
+ * ====================================================================== */
+
+void lisp_send_smr_invoked_request(struct lisp *lisp, const struct prefix *eid)
+{
+	struct listnode *node;
+	struct lisp_ms_mr *ms;
+	struct lisp_map_request req;
+	struct stream *s;
+	uint8_t nonce[LISP_NONCE_LEN];
+	struct sockaddr_in dst;
+
+	if (lisp->sock < 0)
+		return;
+
+	lisp_nonce_generate(nonce);
+
+	memset(&req, 0, sizeof(req));
+	memcpy(req.nonce, nonce, LISP_NONCE_LEN);
+	req.smr_invoked    = true; /* s-bit: triggered by SMR (§5.2) */
+	req.record_count   = 1;
+	req.itr_rloc_count = 1;
+	prefix_copy(&req.records[0].eid_prefix, eid);
+	prefix_copy(&req.src_eid, eid);
+
+	s = stream_new(LISP_MAX_PACKET_SIZE);
+
+	for (ALL_LIST_ELEMENTS_RO(lisp->ms_mr_list, node, ms)) {
+		struct lisp_pending_req *pending;
+
+		if (!ms->map_resolver)
+			continue;
+		if (ms->addr.family != AF_INET)
+			continue;
+
+		prefix_copy(&req.itr_rlocs[0], &ms->addr);
+
+		stream_reset(s);
+		if (lisp_encode_ecm(s, &req, &ms->addr, &ms->addr) < 0)
+			continue;
+
+		memset(&dst, 0, sizeof(dst));
+		dst.sin_family = AF_INET;
+		dst.sin_port   = htons(LISP_CONTROL_PORT);
+		dst.sin_addr   = ms->addr.u.prefix4;
+
+		if (sendto(lisp->sock, STREAM_DATA(s), stream_get_endp(s), 0,
+			   (struct sockaddr *)&dst, sizeof(dst)) < 0) {
+			flog_err_sys(EC_LISP_SOCKET,
+				     "LISP: sendto SMR-invoked Map-Request to %pI4 failed: %s",
+				     &dst.sin_addr, safe_strerror(errno));
+			continue;
+		}
+
+		pending = lisp_pending_req_lookup(lisp, nonce);
+		if (!pending)
+			lisp_pending_req_add(lisp, eid, &ms->addr, nonce);
+
+		if (IS_LISP_DEBUG_EVENTS) {
+			char buf[PREFIX2STR_BUFFER];
+
+			prefix2str(eid, buf, sizeof(buf));
+			zlog_debug(
+				"LISP mobility: sent SMR-invoked Map-Request for %s to %pI4",
+				buf, &dst.sin_addr);
+		}
+	}
+
+	stream_free(s);
+}
+
+/* =========================================================================
  * Map-Reply sender  (ETR, RFC 9301 §6.2)
  *
  * Called when we receive a Map-Request for one of our local EID prefixes.
@@ -822,6 +899,18 @@ static void lisp_handle_map_request(struct lisp *lisp, struct stream *s,
 	}
 
 	/*
+	 * draft-ietf-lisp-eid-mobility §5.2: handle Solicit-Map-Request.
+	 * A Map-Request with the S-bit set is an SMR sent by an ETR or MS to
+	 * notify this ITR that its cached mapping for the included EID(s) is
+	 * stale.  We invalidate those cache entries and send SMR-invoked
+	 * Map-Requests to obtain fresh mappings.
+	 */
+	if (req.smr) {
+		lisp_mobility_handle_smr(lisp, &req, src);
+		return;
+	}
+
+	/*
 	 * RFC 9437 §4.1: detect pub/sub requests.
 	 * An AFI=0 ITR-RLOC with N-bit set signals unsubscription.
 	 */
@@ -896,6 +985,32 @@ static void lisp_handle_map_notify(struct lisp *lisp, struct stream *s,
 		zlog_debug("LISP: Map-Notify for %u EID(s)", notify.record_count);
 
 	/*
+	 * draft-ietf-lisp-eid-mobility §5.3: Away Table population.
+	 *
+	 * If the Map-Notify contains an EID that this node has registered
+	 * locally, it means the Map-Server is informing us that another xTR
+	 * has taken over that EID (i.e. the EID has moved away).  We add the
+	 * EID to the Away Table so data-driven SMRs can be generated when
+	 * traffic for that EID still arrives here.
+	 */
+	{
+		int _i;
+
+		for (_i = 0; _i < notify.record_count && _i < 8; _i++) {
+			struct route_node *rn;
+
+			rn = route_node_lookup(lisp->local_eids,
+					       &notify.records[_i].eid_prefix);
+			if (rn && rn->info) {
+				lisp_mobility_away_add(
+					lisp,
+					&notify.records[_i].eid_prefix);
+				route_unlock_node(rn);
+			}
+		}
+	}
+
+	/*
 	 * If we have active subscriptions for any of the EIDs in this
 	 * Map-Notify, route to the pub/sub handler (RFC 9437 §5).
 	 * Otherwise this is a registration confirmation and no further
@@ -926,10 +1041,41 @@ static void lisp_handle_map_notify_ack(struct lisp *lisp, struct stream *s,
 static void lisp_handle_ecm(struct lisp *lisp, struct stream *s,
 			    struct sockaddr_storage *src)
 {
+	struct lisp_map_request req;
+	struct stream *inner;
+	size_t saved_getp;
+	int i;
+
 	if (lisp_decode_ecm(s) < 0) {
 		flog_err(EC_LISP_PACKET, "LISP: malformed ECM header");
 		return;
 	}
+
+	/*
+	 * draft-ietf-lisp-eid-mobility §4.2: when acting as a Map-Server /
+	 * Map-Resolver, record each ITR-RLOC seen for the queried EID so we
+	 * can target SMRs if mobility is later detected.
+	 *
+	 * We peek at the inner Map-Request without consuming the stream so
+	 * the normal lisp_handle_map_request() path still works below.
+	 */
+	if (lisp->ms_role && STREAM_READABLE(s) > 0) {
+		saved_getp = stream_get_getp(s);
+		inner = stream_dup(s);
+
+		if (lisp_decode_map_request(inner, &req) == 0
+		    && req.itr_rloc_count > 0) {
+			for (i = 0; i < req.record_count && i < 8; i++) {
+				lisp_mobility_track_itr(
+					lisp,
+					&req.records[i].eid_prefix,
+					&req.itr_rlocs[0]);
+			}
+		}
+		stream_free(inner);
+		stream_set_getp(s, saved_getp);
+	}
+
 	/* Inner message must be a Map-Request. */
 	lisp_handle_map_request(lisp, s, src);
 }
@@ -977,9 +1123,16 @@ int lisp_recv_packet(struct thread *t)
 		lisp_handle_map_reply(lisp, s);
 		break;
 	case LISP_MAP_REGISTER:
-		/* We don't implement Map-Server role here. */
-		if (IS_LISP_DEBUG_PACKET)
-			zlog_debug("LISP: ignoring Map-Register (not MS)");
+		/*
+		 * draft-ietf-lisp-eid-mobility §4: process as Map-Server when
+		 * ms_role is enabled.  The handler updates ms_db, detects EID
+		 * mobility, triggers SMRs and pub/sub notifications, and sends
+		 * Map-Notify acknowledgements.
+		 */
+		if (lisp->ms_role)
+			lisp_mobility_handle_map_register(lisp, s, &src);
+		else if (IS_LISP_DEBUG_PACKET)
+			zlog_debug("LISP: ignoring Map-Register (ms-role not enabled)");
 		break;
 	case LISP_MAP_NOTIFY:
 		lisp_handle_map_notify(lisp, s, &src);
@@ -1033,6 +1186,11 @@ struct lisp *lisp_create(const char *vrf_name, struct vrf *vrf, int socket)
 	/* RFC 9437 pub/sub state lists. */
 	lisp->subscriptions = list_new();
 	lisp->sub_states    = list_new();
+
+	/* EID mobility state (draft-ietf-lisp-eid-mobility-17). */
+	lisp->ms_role    = false;
+	lisp->ms_db      = route_table_init();
+	lisp->away_table = route_table_init();
 
 	/* VxLAN-GPE data-plane state (RFC 9301 §2.4). */
 	lisp->data_sock         = lisp_vxlan_create_socket(vrf);
@@ -1111,6 +1269,14 @@ void lisp_clean(struct lisp *lisp)
 	/* Clean pending requests. */
 	hash_clean(lisp->pending_requests, lisp_pending_req_free);
 	hash_free(lisp->pending_requests);
+
+	/* Clean EID mobility state (draft-ietf-lisp-eid-mobility-17). */
+	lisp_mobility_ms_db_clean(lisp);
+	route_table_finish(lisp->ms_db);
+	lisp->ms_db = NULL;
+	lisp_mobility_away_clean(lisp);
+	route_table_finish(lisp->away_table);
+	lisp->away_table = NULL;
 
 	/* Clean pub/sub state (RFC 9437). */
 	lisp_pubsub_clean(lisp);

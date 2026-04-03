@@ -9,6 +9,7 @@ dist_examples_DATA += lispd/lispd.conf.sample
 vtysh_scan += \
 	$(top_srcdir)/lispd/lisp_cli.c \
 	$(top_srcdir)/lispd/lisp_debug.c \
+	$(top_srcdir)/lispd/lisp_mobility.c \
 	$(top_srcdir)/lispd/lisp_pubsub.c \
 	$(top_srcdir)/lispd/lisp_vxlan.c \
 	$(top_srcdir)/lispd/lispd.c \
@@ -24,6 +25,7 @@ lispd_liblisp_a_SOURCES = \
 	lispd/lisp_errors.c \
 	lispd/lisp_interface.c \
 	lispd/lisp_memory.c \
+	lispd/lisp_mobility.c \
 	lispd/lisp_packet.c \
 	lispd/lisp_pubsub.c \
 	lispd/lisp_vxlan.c \
@@ -38,6 +40,7 @@ noinst_HEADERS += \
 	lispd/lisp_errors.h \
 	lispd/lisp_interface.h \
 	lispd/lisp_memory.h \
+	lispd/lisp_mobility.h \
 	lispd/lisp_packet.h \
 	lispd/lisp_pubsub.h \
 	lispd/lisp_vxlan.h \
